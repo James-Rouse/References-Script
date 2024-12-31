@@ -3,20 +3,30 @@ import re
 import requests
 import time
 import csv
+import hashlib
+import warnings
+import urllib3
 from pathlib import Path
 from Bio import Entrez
 from tqdm import tqdm
+import xml.etree.ElementTree as ET
+from urllib3.exceptions import InsecureRequestWarning
+
+# Suppress SSL warnings
+warnings.simplefilter('ignore', InsecureRequestWarning)
 
 # Constants
 CROSSREF_API = 'https://api.crossref.org/works'
 UNPAYWALL_BASE = 'https://api.unpaywall.org/v2/'
-UNPAYWALL_EMAIL = 'james.thomas.rouse@gmail.com'  # Replace with your actual email
-DELAY = 1  # seconds between API requests
-TIMEOUT = 10  # seconds for API request timeout
-MAX_RETRIES = 3  # Maximum number of retries for API requests
+UNPAYWALL_EMAIL = 'james.thomas.rouse@gmail.com'
+DELAY = 2  # Increased delay between requests
+TIMEOUT = 15  # Increased timeout
+MAX_RETRIES = 3
+MAX_FILENAME_LENGTH = 100
+CORE_API_KEY = 'your_core_api_key'
 
 # Entrez configuration
-NCBI_EMAIL = "james.thomas.rouse@gmail.com"  # Replace with your actual email
+NCBI_EMAIL = "james.thomas.rouse@gmail.com"
 Entrez.email = NCBI_EMAIL
 
 # Directories
@@ -26,25 +36,37 @@ OUTPUT_DIR = BASE_DIR / "full_texts"
 REFS_FILE = REFS_DIR / "scrupulosity_references.txt"
 RESULTS_FILE = OUTPUT_DIR / "results.csv"
 
-# Headers for HTTP requests
+# Headers
 HEADERS = {
     'User-Agent': 'ReferencesSearch/1.0 (mailto:james.thomas.rouse@gmail.com)'
 }
 
+def exponential_backoff(attempt):
+    """Calculate delay with exponential backoff."""
+    return DELAY * (2 ** attempt)
+
+def get_safe_filename(reference, doi):
+    """Create safe filename from reference and DOI."""
+    # Create base filename from reference
+    safe_name = re.sub(r'[\\/*?:"<>|]', "_", reference)
+    safe_name = safe_name[:MAX_FILENAME_LENGTH]
+    
+    # Add hash of full reference to ensure uniqueness
+    name_hash = hashlib.md5(reference.encode()).hexdigest()[:8]
+    
+    return f"{safe_name}_{name_hash}.pdf"
+
 def extract_doi(reference):
-    """
-    Extract DOI from a reference using regex.
-    Returns the DOI string if found, else None.
-    """
+    """Extract DOI from reference."""
     doi_pattern = r'(10.\d{4,9}/[-._;()/:A-Z0-9]+)'
     match = re.search(doi_pattern, reference, re.IGNORECASE)
-    return match.group(1) if match else None
+    return match.group(1).lower() if match else None
 
 def read_references(file_path=REFS_FILE):
-    """Read references from text file with detailed debugging."""
+    """Read references from file."""
     try:
         path = Path(file_path).resolve()
-        print(f"Attempting to read: {path}")
+        print(f"Reading: {path}")
         
         if not path.exists():
             print(f"File not found: {path}")
@@ -54,24 +76,27 @@ def read_references(file_path=REFS_FILE):
             references = [line.strip() for line in file if line.strip()]
             
         print(f"Found {len(references)} references")
-        if references:
-            print("First reference:", references[0][:50], "...")
-        
         return references
             
+    except UnicodeDecodeError:
+        try:
+            with open(file_path, 'r', encoding='cp1252', errors='replace') as file:
+                references = [line.strip() for line in file if line.strip()]
+            print(f"Found {len(references)} references (cp1252 encoding)")
+            return references
+        except Exception as e:
+            print(f"Failed to read references: {e}")
+            return []
     except Exception as e:
-        print(f"Error reading file: {str(e)}")
+        print(f"Error reading file: {e}")
         return []
 
 def search_crossref(title):
-    """Search CrossRef API for reference and return DOI."""
-    for attempt in range(1, MAX_RETRIES + 1):
+    """Search CrossRef API for DOI."""
+    for attempt in range(MAX_RETRIES):
         try:
-            print(f"Searching CrossRef for: {title[:50]}...")
-            params = {
-                'query.bibliographic': title,
-                'rows': 1
-            }
+            print(f"Searching CrossRef for DOI: {title[:50]}...")
+            params = {'query.bibliographic': title, 'rows': 1}
             
             response = requests.get(
                 CROSSREF_API,
@@ -81,176 +106,205 @@ def search_crossref(title):
             )
             response.raise_for_status()
             data = response.json()
-            time.sleep(DELAY)  # Respect rate limiting
             
             if data['message']['items']:
                 result = data['message']['items'][0]
-                doi = result.get('DOI')
-                found_title = result.get('title', [''])[0]
-                print(f"Found DOI: {doi} for title: {found_title[:50]}...")
+                doi = result.get('DOI', '').lower()
                 return doi
-            else:
-                print(f"No DOI found for: {title}")
-                return None
-                
-        except requests.Timeout:
-            print(f"CrossRef request timed out for: {title}. Attempt {attempt}/{MAX_RETRIES}")
-        except requests.RequestException as e:
-            print(f"CrossRef HTTP error for '{title}': {str(e)}. Attempt {attempt}/{MAX_RETRIES}")
-        except ValueError as e:
-            print(f"CrossRef JSON decoding failed for '{title}': {str(e)}. Attempt {attempt}/{MAX_RETRIES}")
-        except Exception as e:
-            print(f"Unexpected error in CrossRef search for '{title}': {str(e)}. Attempt {attempt}/{MAX_RETRIES}")
-        
-        if attempt < MAX_RETRIES:
-            print("Retrying...")
-            time.sleep(DELAY)
-        else:
-            print("Max retries reached. Moving to next reference.")
             return None
+                
+        except Exception as e:
+            print(f"CrossRef Error: {e}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(exponential_backoff(attempt))
+            else:
+                return None
 
 def get_unpaywall_pdf_url(doi):
-    """Use Unpaywall API to get open access PDF URL."""
-    for attempt in range(1, MAX_RETRIES + 1):
+    """Get PDF URL from Unpaywall."""
+    for attempt in range(MAX_RETRIES):
         try:
+            print(f"Searching Unpaywall for PDF: {doi}")
             url = f"{UNPAYWALL_BASE}{doi}"
             params = {'email': UNPAYWALL_EMAIL}
             response = requests.get(url, params=params, timeout=TIMEOUT)
             response.raise_for_status()
             data = response.json()
-            time.sleep(DELAY)  # Respect rate limiting
             
             if data.get('is_oa') and data.get('best_oa_location'):
-                # Prefer 'url_for_pdf' if available
-                pdf_url = data['best_oa_location'].get('url_for_pdf') or data['best_oa_location'].get('url')
+                pdf_url = (data['best_oa_location'].get('url_for_pdf') or 
+                          data['best_oa_location'].get('url'))
                 if pdf_url:
-                    print(f"Found Unpaywall PDF URL: {pdf_url}")
                     return pdf_url
-            print(f"No Open Access PDF found via Unpaywall for DOI: {doi}")
             return None
-        except requests.Timeout:
-            print(f"Unpaywall request timed out for DOI: {doi}. Attempt {attempt}/{MAX_RETRIES}")
-        except requests.RequestException as e:
-            print(f"Unpaywall HTTP error for DOI '{doi}': {str(e)}. Attempt {attempt}/{MAX_RETRIES}")
-        except ValueError as e:
-            print(f"Unpaywall JSON decoding failed for DOI '{doi}': {str(e)}. Attempt {attempt}/{MAX_RETRIES}")
+            
         except Exception as e:
-            print(f"Unexpected error in Unpaywall search for DOI '{doi}': {str(e)}. Attempt {attempt}/{MAX_RETRIES}")
+            print(f"Unpaywall Error: {e}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(exponential_backoff(attempt))
+            else:
+                return None
+
+def search_pmc(doi):
+    """Search PubMed Central for PDF."""
+    try:
+        print(f"Searching PMC for PDF: {doi}")
+        url = f"https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/?ids={doi}&format=xml"
+        response = requests.get(url, timeout=TIMEOUT)
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+        article = root.find('record')
         
-        if attempt < MAX_RETRIES:
-            print("Retrying...")
-            time.sleep(DELAY)
-        else:
-            print("Max retries reached. Moving to next reference.")
-            return None
+        if article is not None and article.find('pmcid') is not None:
+            pmcid = article.find('pmcid').text
+            pdf_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/pdf/"
+            return pdf_url
+        return None
+        
+    except Exception as e:
+        print(f"PMC Error: {e}")
+        return None
+
+def search_core(doi):
+    """Search CORE for PDF."""
+    try:
+        print(f"Searching CORE for PDF: {doi}")
+        url = f"https://core.ac.uk:443/api-v2/articles/doi/{doi}"
+        headers = {'Authorization': f'Bearer {CORE_API_KEY}'}
+        response = requests.get(url, headers=headers, timeout=TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        
+        if data.get('fullTextUrl'):
+            pdf_url = data['fullTextUrl']
+            return pdf_url
+        return None
+        
+    except Exception as e:
+        print(f"CORE Error: {e}")
+        return None
+
+def get_pdf_url(doi):
+    """Try multiple sources for PDF URL."""
+    # Try Unpaywall
+    pdf_url = get_unpaywall_pdf_url(doi)
+    if (pdf_url):
+        return pdf_url
+    
+    time.sleep(DELAY)
+    
+    # Try PMC
+    pdf_url = search_pmc(doi)
+    if (pdf_url):
+        return pdf_url
+    
+    time.sleep(DELAY)
+    
+    # Try CORE
+    pdf_url = search_core(doi)
+    return pdf_url
 
 def download_pdf(pdf_url, filename):
-    """Download PDF from URL and save to filename."""
-    for attempt in range(1, MAX_RETRIES + 1):
+    """Download PDF with retries."""
+    for attempt in range(MAX_RETRIES):
         try:
-            response = requests.get(pdf_url, headers=HEADERS, timeout=TIMEOUT)
+            response = requests.get(
+                pdf_url,
+                headers=HEADERS,
+                timeout=TIMEOUT,
+                verify=False  # Disable SSL verification
+            )
             response.raise_for_status()
+            
             with open(filename, 'wb') as f:
                 f.write(response.content)
-            print(f"Saved: {filename}")
             return True
-        except requests.Timeout:
-            print(f"Download timed out for: {pdf_url}. Attempt {attempt}/{MAX_RETRIES}")
-        except requests.RequestException as e:
-            print(f"HTTP error while downloading '{pdf_url}': {str(e)}. Attempt {attempt}/{MAX_RETRIES}")
+            
         except Exception as e:
-            print(f"Unexpected error while downloading '{pdf_url}': {str(e)}. Attempt {attempt}/{MAX_RETRIES}")
-        
-        if attempt < MAX_RETRIES:
-            print("Retrying...")
-            time.sleep(DELAY)
-        else:
-            print("Max retries reached. Failed to download PDF.")
-            return False
+            print(f"Download Error: {e}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(exponential_backoff(attempt))
+            else:
+                return False
 
-def save_results(results, output_file=RESULTS_FILE):
-    """Save all results to a CSV file."""
+def save_results(results):
+    """Save results to CSV."""
     try:
-        with open(output_file, 'w', newline='', encoding='utf-8') as f:
-            fieldnames = ['reference', 'DOI', 'Retrieved', 'Source']
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+        with open(RESULTS_FILE, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=['reference', 'DOI', 'Retrieved', 'Source'])
             writer.writeheader()
-            for r in results:
-                writer.writerow(r)
-        print(f"Results saved to {output_file}")
+            writer.writerows(results)
+        print(f"Results saved to {RESULTS_FILE}")
     except Exception as e:
-        print(f"Error saving results to CSV: {str(e)}")
+        print(f"Error saving results: {e}")
 
 def main():
-    """Main function to process references."""
-    # Ensure directories exist
+    """Main function."""
+    # Create directories
     REFS_DIR.mkdir(exist_ok=True)
     OUTPUT_DIR.mkdir(exist_ok=True)
     
-    # Check file existence
-    if not REFS_FILE.exists():
-        print(f"References file not found at: {REFS_FILE}")
-        print("Please create the file with your references.")
-        return
-    
     # Read references
-    print("\nReading references...")
     references = read_references()
     if not references:
-        print("No references found. Ensure the file is not empty.")
         return
     
-    # Process each reference
     results = []
     for ref in tqdm(references, desc="Processing references"):
-        ref = ref.strip()
-        if not ref:
-            continue
-        
-        # Extract DOI if present
-        doi = extract_doi(ref)
-        if doi:
-            print(f"Extracted DOI from reference: {doi}")
-        else:
-            # Search CrossRef for DOI
-            doi = search_crossref(ref)
-        
-        if not doi:
-            results.append({
-                "reference": ref,
-                "DOI": "",
-                "Retrieved": False,
-                "Source": "No DOI found"
-            })
-            continue
-        
-        # Fetch PDF URL from Unpaywall
-        pdf_url = get_unpaywall_pdf_url(doi)
-        if not pdf_url:
+        try:
+            # Get DOI
+            doi = extract_doi(ref) or search_crossref(ref)
+            if not doi:
+                results.append({
+                    "reference": ref,
+                    "DOI": "",
+                    "Retrieved": False,
+                    "Source": "No DOI found"
+                })
+                continue
+            
+            # Get PDF URL
+            pdf_url = get_pdf_url(doi)
+            if not pdf_url:
+                results.append({
+                    "reference": ref,
+                    "DOI": doi,
+                    "Retrieved": False,
+                    "Source": "No PDF found"
+                })
+                continue
+            
+            # Download PDF
+            filename = OUTPUT_DIR / get_safe_filename(ref, doi)
+            success = download_pdf(pdf_url, filename)
+            
+            if success:
+                source = "PDF Retrieved"
+                print(f"Success: {filename.name}")
+            else:
+                source = "Download Failed"
+                print(f"Failed: {filename.name}")
+
             results.append({
                 "reference": ref,
                 "DOI": doi,
-                "Retrieved": False,
-                "Source": "No OA PDF found"
+                "Retrieved": success,
+                "Source": source
             })
-            continue
-        
-        # Define safe filename
-        safe_ref = re.sub(r'[\\/*?:"<>|]', "_", ref)
-        filename = OUTPUT_DIR / f"{safe_ref}.pdf"
-        
-        # Download PDF
-        success = download_pdf(pdf_url, filename)
-        results.append({
-            "reference": ref,
-            "DOI": doi,
-            "Retrieved": success,
-            "Source": "Unpaywall" if success else "Download Failed"
-        })
+            
+            time.sleep(DELAY)
+            
+        except Exception as e:
+            print(f"Processing Error: {e}")
+            results.append({
+                "reference": ref,
+                "DOI": doi if 'doi' in locals() else "",
+                "Retrieved": False,
+                "Source": f"Error: {str(e)}"
+            })
     
     # Save results
     save_results(results)
-    print("\nAll references processed.")
 
 if __name__ == "__main__":
     main()
